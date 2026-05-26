@@ -15,6 +15,7 @@
 #include <ksyms.h>
 #include <linux/kallsyms.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/mm_types.h>
 #include <linux/rculist.h>
 /* init_task: use wx_init_task via kallsyms (framework doesn't export it) */
@@ -78,8 +79,11 @@ static inline struct task_struct *wx_next_task(struct task_struct *task)
 
 /* Memory management */
 extern void *(*kfunc_find_vma)(void *mm, unsigned long addr);
+extern void *(*kfunc_find_vma_prev)(void *mm, unsigned long addr, void **pprev);
+void *wxshadow_find_vma(void *mm, unsigned long addr);
 extern void *(*kfunc_get_task_mm)(void *task);
 extern void (*kfunc_mmput)(void *mm);
+void wxshadow_mmput_safe(void *mm);
 /* find_task_by_vpid: use find_task_by_vpid() from linux/sched.h */
 
 /* exit_mmap hook */
@@ -387,11 +391,18 @@ static inline void *mm_pgd(void *mm) {
 
 static inline void *safe_kcalloc(size_t n, size_t size, unsigned int flags)
 {
+    void *ptr;
+    size_t total;
+
     if (kfunc_kcalloc)
         return kfunc_kcalloc(n, size, flags);
     if (n != 0 && size > ((size_t)-1) / n)
         return NULL;
-    return kfunc_kzalloc(n * size, flags);
+    total = n * size;
+    ptr = kfunc_kzalloc(total, flags);
+    if (ptr)
+        memset(ptr, 0, total);
+    return ptr;
 }
 
 /* ========== Address translation ========== */
@@ -597,6 +608,5 @@ int scan_mm_struct_offsets(void);
 int scan_vma_struct_offsets(void);
 int detect_task_struct_offsets(void);
 int try_scan_mm_context_id_offset(void);
-void debug_print_tasks_list(int max_count);
 
 #endif /* _KPM_WXSHADOW_INTERNAL_H_ */

@@ -33,6 +33,7 @@ KPM_DESCRIPTION("W^X Shadow Memory - Hidden Breakpoint Mechanism");
 
 /* Memory management */
 void *(*kfunc_find_vma)(void *mm, unsigned long addr);
+void *(*kfunc_find_vma_prev)(void *mm, unsigned long addr, void **pprev);
 void *(*kfunc_get_task_mm)(void *task);
 void (*kfunc_mmput)(void *mm);
 /* find_task_by_vpid: use find_task_by_vpid() from linux/sched.h */
@@ -200,11 +201,40 @@ void wxshadow_page_put(struct wxshadow_page *page)
 
     if (should_free) {
         for (i = 0; i < nr_patch_data; i++)
-            kfunc_kfree(patch_data[i]);
+            if (kfunc_kfree)
+                kfunc_kfree(patch_data[i]);
         if (shadow_vaddr)
-            kfunc_free_pages(shadow_vaddr, 0);
-        kfunc_kfree(page);
+            if (kfunc_free_pages)
+                kfunc_free_pages(shadow_vaddr, 0);
+        if (kfunc_kfree)
+            kfunc_kfree(page);
     }
+}
+
+void wxshadow_mmput_safe(void *mm)
+{
+    if (!mm)
+        return;
+
+    if (kfunc_mmput) {
+        kfunc_mmput(mm);
+        return;
+    }
+
+    pr_warn("wxshadow: mmput unavailable, mm ref not released\n");
+}
+
+void *wxshadow_find_vma(void *mm, unsigned long addr)
+{
+    void *prev = NULL;
+
+    if (kfunc_find_vma)
+        return kfunc_find_vma(mm, addr);
+
+    if (kfunc_find_vma_prev)
+        return kfunc_find_vma_prev(mm, addr, &prev);
+
+    return NULL;
 }
 
 /* ========== Helper functions ========== */
@@ -240,10 +270,22 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr)
 {
     struct wxshadow_page *page;
 
+    if (!kfunc_kzalloc) {
+        pr_err("wxshadow: kzalloc unavailable\n");
+        return NULL;
+    }
+
     /* Allocate new page structure */
     page = kfunc_kzalloc(sizeof(*page), 0xcc0);
     if (!page)
         return NULL;
+
+    /*
+     * Some Android kernels resolve kzalloc to a kmalloc-style fallback in
+     * kallsyms.  Make the zeroing explicit so counters such as nr_patches
+     * cannot contain stale allocator data and spin inside dirty tracking.
+     */
+    memset(page, 0, sizeof(*page));
 
     page->mm = mm;
     page->page_addr = page_addr;
@@ -409,11 +451,8 @@ void wxshadow_mark_patch_dirty(struct wxshadow_page *page, unsigned long offset,
     if (!page)
         return;
 
-    (void)offset;
-    (void)len;
-
     spin_lock(&global_lock);
-    wxshadow_rebuild_dirty_tracking_locked(page);
+    wxshadow_bitmap_set_range(page->patch_dirty, offset, len);
     spin_unlock(&global_lock);
 }
 
@@ -422,10 +461,8 @@ void wxshadow_mark_bp_dirty(struct wxshadow_page *page, unsigned long offset)
     if (!page)
         return;
 
-    (void)offset;
-
     spin_lock(&global_lock);
-    wxshadow_rebuild_dirty_tracking_locked(page);
+    wxshadow_bitmap_set_range(page->bp_dirty, offset, AARCH64_INSN_SIZE);
     spin_unlock(&global_lock);
 }
 
@@ -434,10 +471,8 @@ void wxshadow_clear_bp_dirty(struct wxshadow_page *page, unsigned long offset)
     if (!page)
         return;
 
-    (void)offset;
-
     spin_lock(&global_lock);
-    wxshadow_rebuild_dirty_tracking_locked(page);
+    wxshadow_bitmap_clear_range(page->bp_dirty, offset, AARCH64_INSN_SIZE);
     spin_unlock(&global_lock);
 }
 
@@ -732,7 +767,7 @@ retry:
 
     if (state != WX_STATE_DORMANT && state != WX_STATE_NONE) {
         mm = page->mm;
-        if (!mm || !page->pfn_original || !kfunc_find_vma) {
+        if (!mm || !page->pfn_original || !(kfunc_find_vma || kfunc_find_vma_prev)) {
             ret = -14;
             goto out_fail_locked;
         }
@@ -743,7 +778,7 @@ retry:
             goto out_fail_locked;
         }
 
-        vma = kfunc_find_vma(mm, page->page_addr);
+        vma = wxshadow_find_vma(mm, page->page_addr);
         if (!vma || vma_start(vma) > page->page_addr) {
             ret = -14;
             goto out_fail_locked;
@@ -878,7 +913,7 @@ retry:
         goto out_fail;
 
     mm = page->mm;
-    if (!mm || !page->pfn_original || !kfunc_find_vma) {
+    if (!mm || !page->pfn_original || !(kfunc_find_vma || kfunc_find_vma_prev)) {
         ret = -14;
         goto out_fail;
     }
@@ -889,7 +924,7 @@ retry:
         goto out_fail;
     }
 
-    vma = kfunc_find_vma(mm, page->page_addr);
+    vma = wxshadow_find_vma(mm, page->page_addr);
     if (!vma || vma_start(vma) > page->page_addr) {
         ret = -14;
         goto out_fail;
@@ -1063,7 +1098,8 @@ int wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
     }
 
     /* --- Step 4: restore PTE to original --- */
-    if (page->mm && page->pfn_original && kfunc_find_vma) {
+    if (page->mm && page->pfn_original &&
+        (kfunc_find_vma || kfunc_find_vma_prev)) {
         void *mm = page->mm;
         u64 probe;
         if (!is_kva((unsigned long)mm) ||
@@ -1072,7 +1108,7 @@ int wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
                     mm, page->page_addr);
             ret = -14;
         } else {
-            void *vma = kfunc_find_vma(mm, page->page_addr);
+            void *vma = wxshadow_find_vma(mm, page->page_addr);
             if (!vma || vma_start(vma) > page->page_addr) {
                 pr_warn("wxshadow: [teardown] no vma for addr=%lx during %s\n",
                         page->page_addr, reason);
@@ -1392,10 +1428,9 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
     /* page_list already initialized by LIST_HEAD() macro */
 
     /* Register BRK/step handlers */
-    /* NOTE: Temporarily prefer REGISTER method for testing */
     if (kfunc_register_user_break_hook && kfunc_register_user_step_hook) {
-        /* Method 1: register_user_*_hook API (testing priority) */
-        pr_info("wxshadow: using register_user_*_hook API (testing priority)\n");
+        /* Method 1: register_user_*_hook API */
+        pr_info("wxshadow: using register_user_*_hook API\n");
 
         /* Initialize list_head nodes */
         INIT_LIST_HEAD(&wxshadow_break_hook.node);
@@ -1542,9 +1577,6 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
     } else {
         pr_info("wxshadow: GUP hiding DISABLED\n");
     }
-
-    /* Debug: print first 10 processes */
-    debug_print_tasks_list(10);
 
     return 0;
 }

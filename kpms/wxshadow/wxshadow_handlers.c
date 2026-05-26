@@ -41,8 +41,14 @@ int wxshadow_handle_read_fault(void *mm, unsigned long addr)
         return -1;
     }
 
+    if (!(kfunc_find_vma || kfunc_find_vma_prev)) {
+        wxshadow_teardown_page(page_info, "find_vma missing (read fault)");
+        wxshadow_page_put(page_info);
+        return -1;
+    }
+
     /* Get VMA for page switching (lockless) */
-    vma = kfunc_find_vma(mm, addr);
+    vma = wxshadow_find_vma(mm, addr);
     if (!vma || vma_start(vma) > addr) {
         wxshadow_teardown_page(page_info, "VMA Gone (read fault)");
         wxshadow_page_put(page_info);
@@ -92,8 +98,14 @@ int wxshadow_handle_exec_fault(void *mm, unsigned long addr)
         return -1;
     }
 
+    if (!(kfunc_find_vma || kfunc_find_vma_prev)) {
+        wxshadow_teardown_page(page_info, "find_vma missing (exec fault)");
+        wxshadow_page_put(page_info);
+        return -1;
+    }
+
     /* Get VMA for page switching (lockless) */
-    vma = kfunc_find_vma(mm, addr);
+    vma = wxshadow_find_vma(mm, addr);
     if (!vma || vma_start(vma) > addr) {
         wxshadow_teardown_page(page_info, "VMA Gone (exec fault)");
         wxshadow_page_put(page_info);
@@ -131,20 +143,23 @@ static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
     void *mm;
     struct wxshadow_page *page;
 
+    if (!kfunc_get_task_mm)
+        return;
+
     mm = kfunc_get_task_mm(current);
     if (!mm)
         return;
 
     access = wxshadow_classify_permission_fault(esr);
     if (access == WXSHADOW_FAULT_NONE) {
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         return;
     }
 
     /* Check if this is a wxshadow page at this address */
     page = wxshadow_find_page(mm, far);
     if (!page) {
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         return;
     }
 
@@ -154,7 +169,7 @@ static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
             args->ret = 0;
             args->skip_origin = true;
             wxshadow_page_put(page);   /* release our find_page ref */
-            kfunc_mmput(mm);
+            wxshadow_mmput_safe(mm);
             return;
         }
     } else if (access == WXSHADOW_FAULT_READ) {
@@ -163,7 +178,7 @@ static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
             args->ret = 0;
             args->skip_origin = true;
             wxshadow_page_put(page);   /* release our find_page ref */
-            kfunc_mmput(mm);
+            wxshadow_mmput_safe(mm);
             return;
         }
     } else {
@@ -172,7 +187,7 @@ static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
     }
 
     wxshadow_page_put(page);   /* release our find_page ref */
-    kfunc_mmput(mm);
+    wxshadow_mmput_safe(mm);
 }
 
 void do_page_fault_before(hook_fargs3_t *args, void *udata)
@@ -426,7 +441,7 @@ static void wxshadow_pause_parent_shadow_pages(void *parent_mm)
                 !page->logical_release_pending) {
                 spin_unlock(&global_lock);
 
-                vma = kfunc_find_vma ? kfunc_find_vma(parent_mm, batch[i].page_addr) : NULL;
+                vma = (kfunc_find_vma || kfunc_find_vma_prev) ? wxshadow_find_vma(parent_mm, batch[i].page_addr) : NULL;
                 if (vma && vma_start(vma) <= batch[i].page_addr) {
                     ret = wxshadow_page_enter_dormant_locked(page, vma,
                                                              batch[i].page_addr);
@@ -507,7 +522,7 @@ static void wxshadow_resume_parent_shadow_pages(void *parent_mm)
                 wxshadow_page_has_active_mods_locked(page)) {
                 spin_unlock(&global_lock);
 
-                vma = kfunc_find_vma ? kfunc_find_vma(parent_mm, batch[i].page_addr) : NULL;
+                vma = (kfunc_find_vma || kfunc_find_vma_prev) ? wxshadow_find_vma(parent_mm, batch[i].page_addr) : NULL;
                 if (vma && vma_start(vma) <= batch[i].page_addr) {
                     ret = wxshadow_page_activate_shadow_locked(page, vma,
                                                                batch[i].page_addr);
@@ -632,10 +647,15 @@ void before_copy_process_wx(hook_fargs8_t *args, void *udata)
     }
 
     args->local.data0 = 1;
+    if (!kfunc_get_task_mm) {
+        WX_HANDLER_EXIT();
+        return;
+    }
+
     parent_mm = kfunc_get_task_mm(current);
     if (parent_mm) {
         wxshadow_pause_parent_shadow_pages(parent_mm);
-        kfunc_mmput(parent_mm);
+        wxshadow_mmput_safe(parent_mm);
     }
     WX_HANDLER_EXIT();
 }
@@ -652,10 +672,15 @@ void after_copy_process_wx(hook_fargs8_t *args, void *udata)
         return;
     }
 
+    if (!kfunc_get_task_mm) {
+        WX_HANDLER_EXIT();
+        return;
+    }
+
     parent_mm = kfunc_get_task_mm(current);
     if (parent_mm) {
         wxshadow_resume_parent_shadow_pages(parent_mm);
-        kfunc_mmput(parent_mm);
+        wxshadow_mmput_safe(parent_mm);
     }
     WX_HANDLER_EXIT();
 }
@@ -702,6 +727,9 @@ static void wxshadow_apply_reg_mods(struct pt_regs *regs, struct wxshadow_bp *bp
 /* Get current task's mm */
 static void *get_current_mm(void)
 {
+    if (!kfunc_get_task_mm)
+        return NULL;
+
     return kfunc_get_task_mm(current);
 }
 
@@ -822,11 +850,11 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
         if (wxshadow_can_resume_stale_brk(mm, pc)) {
             pr_info("wxshadow: BRK: stale trap at pc=%lx after release, resume current mapping\n",
                     pc);
-            kfunc_mmput(mm);
+            wxshadow_mmput_safe(mm);
             return DBG_HOOK_HANDLED;
         }
         pr_info("wxshadow: BRK: not our breakpoint at pc=%lx\n", pc);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         return DBG_HOOK_ERROR;
     }
 
@@ -839,19 +867,27 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
     if (page_info->dead) {
         spin_unlock(&global_lock);
         wxshadow_page_put(page_info);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         return DBG_HOOK_ERROR;
     }
     page_info->brk_in_flight++;
     spin_unlock(&global_lock);
 
+    if (!(kfunc_find_vma || kfunc_find_vma_prev)) {
+        wxshadow_brk_inflight_put(page_info);
+        wxshadow_teardown_page(page_info, "find_vma missing (BRK handler)");
+        wxshadow_page_put(page_info);
+        wxshadow_mmput_safe(mm);
+        return DBG_HOOK_ERROR;
+    }
+
     /* Get VMA (lockless) */
-    vma = kfunc_find_vma(mm, pc);
+    vma = wxshadow_find_vma(mm, pc);
     if (!vma || vma_start(vma) > pc) {
         wxshadow_brk_inflight_put(page_info);
         wxshadow_teardown_page(page_info, "VMA Gone (BRK handler)");
         wxshadow_page_put(page_info);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         return DBG_HOOK_ERROR;
     }
 
@@ -859,7 +895,7 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
         wxshadow_brk_inflight_put(page_info);
         wxshadow_teardown_page(page_info, "Mapping Changed (BRK handler)");
         wxshadow_page_put(page_info);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         return DBG_HOOK_ERROR;
     }
 
@@ -868,7 +904,7 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
     if (ret != 0) {
         wxshadow_brk_inflight_put(page_info);
         wxshadow_page_put(page_info);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         if (ret == -16) {
             pr_info("wxshadow: BRK: page released while entering step at pc=%lx, resume on original mapping\n",
                     pc);
@@ -885,7 +921,7 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
     }
 
     wxshadow_page_put(page_info);  /* release caller ref */
-    kfunc_mmput(mm);
+    wxshadow_mmput_safe(mm);
 
     kfunc_user_enable_single_step(current);
 
@@ -933,7 +969,7 @@ static int wxshadow_step_handler_impl(struct pt_regs *regs, unsigned int esr)
             if (page_info->dead) {
                 spin_unlock(&global_lock);
                 kfunc_user_disable_single_step(current);
-                kfunc_mmput(mm);
+                wxshadow_mmput_safe(mm);
                 return DBG_HOOK_HANDLED;
             }
             page_addr = page_info->page_addr;
@@ -954,17 +990,25 @@ static int wxshadow_step_handler_impl(struct pt_regs *regs, unsigned int esr)
                     page_info->mm, page_info->page_addr, page_info->state, page_info->stepping_task);
         }
         spin_unlock(&global_lock);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         return DBG_HOOK_ERROR;
     }
 
+    if (!(kfunc_find_vma || kfunc_find_vma_prev)) {
+        wxshadow_teardown_page(page_info, "find_vma missing (step handler)");
+        wxshadow_page_put(page_info);
+        wxshadow_mmput_safe(mm);
+        kfunc_user_disable_single_step(current);
+        return DBG_HOOK_HANDLED;
+    }
+
     /* Get VMA (lockless) */
-    vma = kfunc_find_vma(mm, page_addr);
+    vma = wxshadow_find_vma(mm, page_addr);
 
     if (!vma || vma_start(vma) > page_addr) {
         wxshadow_teardown_page(page_info, "VMA Gone (step handler)");
         wxshadow_page_put(page_info);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         kfunc_user_disable_single_step(current);
         return DBG_HOOK_HANDLED;
     }
@@ -972,7 +1016,7 @@ static int wxshadow_step_handler_impl(struct pt_regs *regs, unsigned int esr)
     if (!wxshadow_validate_page_mapping(mm, vma, page_info, page_addr)) {
         wxshadow_teardown_page(page_info, "Mapping Changed (step handler)");
         wxshadow_page_put(page_info);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         kfunc_user_disable_single_step(current);
         return DBG_HOOK_HANDLED;
     }
@@ -983,7 +1027,7 @@ static int wxshadow_step_handler_impl(struct pt_regs *regs, unsigned int esr)
                page_addr, ret);
         wxshadow_teardown_page(page_info, "step restore shadow failed");
         wxshadow_page_put(page_info);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         kfunc_user_disable_single_step(current);
         return DBG_HOOK_HANDLED;
     }
@@ -997,7 +1041,7 @@ static int wxshadow_step_handler_impl(struct pt_regs *regs, unsigned int esr)
         pr_info("wxshadow: step: state updated to SHADOW_X\n");
     }
     wxshadow_page_put(page_info);  /* release caller ref */
-    kfunc_mmput(mm);
+    wxshadow_mmput_safe(mm);
 
     kfunc_user_disable_single_step(current);
 

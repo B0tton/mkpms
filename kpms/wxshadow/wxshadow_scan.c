@@ -12,36 +12,13 @@
 /* Cached init_process pointer for use by other detection routines */
 static void *wx_init_process = NULL;
 
-/* ========== Safe symbol lookup (vmlinux only, no module traversal) ========== */
+/* ========== Symbol lookup ========== */
 
-struct lookup_data {
-    const char *name;
-    unsigned long addr;
-};
-
-static int lookup_callback(void *data, const char *name, struct module *mod, unsigned long addr)
-{
-    struct lookup_data *ld = data;
-    if (strcmp(name, ld->name) == 0) {
-        ld->addr = addr;
-        return 1; /* stop iteration */
-    }
-    return 0;
-}
-
-/*
- * Safe symbol lookup - only searches vmlinux symbols, never modules.
- * This avoids potential hangs when module_kallsyms_lookup_name
- * traverses the kernel module list.
- */
 static unsigned long lookup_name_safe(const char *name)
 {
-    struct lookup_data ld = { .name = name, .addr = 0 };
-
-    if (kallsyms_on_each_symbol) {
-        kallsyms_on_each_symbol(lookup_callback, &ld);
-    }
-    return ld.addr;
+    if (kallsyms_lookup_name)
+        return kallsyms_lookup_name(name);
+    return 0;
 }
 
 /* ========== Symbol resolution macros ========== */
@@ -69,9 +46,38 @@ int resolve_symbols(void)
 
     /* ===== Memory management (all exported) ===== */
     pr_info("wxshadow: [1/12] mm functions...\n");
-    RESOLVE_SYMBOL(find_vma);
-    RESOLVE_SYMBOL(get_task_mm);
-    RESOLVE_SYMBOL(mmput);
+    kfunc_find_vma = (typeof(kfunc_find_vma))lookup_name_safe("find_vma");
+    if (!kfunc_find_vma)
+        kfunc_find_vma = (typeof(kfunc_find_vma))lookup_name_safe("find_vma.cfi_jt");
+    if (kfunc_find_vma) {
+        pr_info("wxshadow: find_vma found at %px\n", kfunc_find_vma);
+    } else {
+        kfunc_find_vma_prev = (typeof(kfunc_find_vma_prev))
+            lookup_name_safe("find_vma_prev");
+        if (!kfunc_find_vma_prev)
+            kfunc_find_vma_prev = (typeof(kfunc_find_vma_prev))
+                lookup_name_safe("find_vma_prev.cfi_jt");
+        if (kfunc_find_vma_prev) {
+            pr_warn("wxshadow: find_vma missing, using find_vma_prev at %px\n",
+                    kfunc_find_vma_prev);
+        } else {
+            pr_err("wxshadow: failed to find symbol: find_vma/find_vma_prev\n");
+            return -1;
+        }
+    }
+    kfunc_get_task_mm = (typeof(kfunc_get_task_mm))lookup_name_safe("get_task_mm");
+    if (!kfunc_get_task_mm)
+        kfunc_get_task_mm = (typeof(kfunc_get_task_mm))lookup_name_safe("get_task_mm.cfi_jt");
+    if (!kfunc_get_task_mm) {
+        pr_warn("wxshadow: get_task_mm not found, prctl operations will return errors\n");
+    }
+
+    kfunc_mmput = (typeof(kfunc_mmput))lookup_name_safe("mmput");
+    if (!kfunc_mmput)
+        kfunc_mmput = (typeof(kfunc_mmput))lookup_name_safe("mmput.cfi_jt");
+    if (!kfunc_mmput) {
+        pr_warn("wxshadow: mmput not found, continuing with safe no-op release\n");
+    }
     /* find_task_by_vpid: use wxfunc(find_task_by_vpid) */
 
     /* exit_mmap - required, for proper cleanup on process exit */
@@ -116,7 +122,6 @@ int resolve_symbols(void)
     } else {
         pr_info("wxshadow: physvirt_offset not found, using traditional memstart_addr mode\n");
     }
-
     /* Determine PAGE_OFFSET based on VA bits from TCR_EL1 */
     {
         u64 tcr_el1_tmp;
@@ -146,7 +151,6 @@ int resolve_symbols(void)
             }
         }
     }
-
     /* Detect correct physvirt offset using AT instruction */
     {
         unsigned long test_vaddr = kfunc___get_free_pages(0xcc0, 0);
@@ -169,7 +173,6 @@ int resolve_symbols(void)
             kfunc_free_pages(test_vaddr, 0);
         }
     }
-
     /* ===== Page table operations ===== */
     pr_info("wxshadow: [6/12] page table ops...\n");
 
@@ -194,7 +197,6 @@ int resolve_symbols(void)
         pr_info("wxshadow: TCR_EL1=0x%llx, va_bits=%lld, page_shift=%d, page_level=%d\n",
                 tcr_el1, va_bits, wx_page_shift, wx_page_level);
     }
-
     /* Spinlock and task functions - using lookup_name_safe */
     wx__raw_spin_lock = (typeof(wx__raw_spin_lock))lookup_name_safe("_raw_spin_lock");
     wx__raw_spin_unlock = (typeof(wx__raw_spin_unlock))lookup_name_safe("_raw_spin_unlock");
@@ -231,7 +233,6 @@ int resolve_symbols(void)
             pr_info("wxshadow: will use TLBI instruction fallback (requires mm->context.id detection)\n");
         }
     }
-
     /* ===== THP split (optional) ===== */
     kfunc___split_huge_pmd = (typeof(kfunc___split_huge_pmd))
         lookup_name_safe("__split_huge_pmd");
@@ -240,7 +241,6 @@ int resolve_symbols(void)
     } else {
         pr_info("wxshadow: __split_huge_pmd not found (THP disabled or inlined)\n");
     }
-
     /* ===== Cache operations ===== */
     pr_info("wxshadow: [7/12] cache ops...\n");
     RESOLVE_SYMBOL(flush_dcache_page);
@@ -264,7 +264,6 @@ int resolve_symbols(void)
     } else {
         pr_info("wxshadow: using built-in icache flush (dc cvau + ic ialluis)\n");
     }
-
     /* ===== Debug functions ===== */
     pr_info("wxshadow: [8/12] debug/single-step...\n");
     kfunc_user_enable_single_step = (typeof(kfunc_user_enable_single_step))
@@ -376,7 +375,6 @@ int resolve_symbols(void)
     } else {
         pr_warn("wxshadow: copy_from_kernel_nofault not found, using direct access (less safe)\n");
     }
-
     /* copy_from_user removed: PATCH uses PTE walk instead (see copy_from_user_via_pte) */
 
     /* ===== Page fault handler (optional) ===== */
@@ -399,7 +397,6 @@ int resolve_symbols(void)
     } else {
         pr_info("wxshadow: page fault handler found at %px\n", kfunc_do_page_fault);
     }
-
     /* follow_page_pte for GUP hiding (/proc/pid/mem, process_vm_readv, ptrace) */
     pr_info("wxshadow: [14/14] follow_page_pte (GUP hiding)...\n");
     kfunc_follow_page_pte = (void *)lookup_name_safe("follow_page_pte");
@@ -408,7 +405,6 @@ int resolve_symbols(void)
     } else {
         pr_warn("wxshadow: follow_page_pte not found, GUP hiding disabled\n");
     }
-
     /* dup_mmap for precise fork protection (real mm duplication only) */
     kfunc_dup_mmap = (void *)lookup_name_safe("dup_mmap");
     if (kfunc_dup_mmap) {
@@ -423,7 +419,6 @@ int resolve_symbols(void)
     } else {
         pr_warn("wxshadow: uprobe_dup_mmap not found\n");
     }
-
     /* init_task already resolved above via kallsyms */
 
     pr_info("wxshadow: all symbols resolved successfully\n");
@@ -491,6 +486,11 @@ int scan_vma_struct_offsets(void)
      * Use current task's mm to find vma offset.
      * If current has no mm (kernel thread), use default.
      */
+    if (!kfunc_get_task_mm) {
+        pr_warn("wxshadow: get_task_mm unavailable, using default vma offset\n");
+        goto use_default;
+    }
+
     mm = kfunc_get_task_mm(current);
     if (!mm) {
         pr_warn("wxshadow: current task has no mm, using default vma offset\n");
@@ -500,7 +500,7 @@ int scan_vma_struct_offsets(void)
     /* First field of mm_struct is mmap (first VMA) */
     if (!safe_read_ptr((unsigned long)mm, &vma) || !vma) {
         pr_warn("wxshadow: no VMA in current mm, using default offset\n");
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         goto use_default;
     }
 
@@ -520,7 +520,7 @@ int scan_vma_struct_offsets(void)
         }
     }
 
-    kfunc_mmput(mm);
+    wxshadow_mmput_safe(mm);
 
     if (!found) {
         pr_warn("wxshadow: vm_mm offset not found by search\n");
@@ -1071,62 +1071,4 @@ int try_scan_mm_context_id_offset(void)
     /* Will retry at prctl time when in user process context */
     pr_info("wxshadow: context.id scan deferred to first prctl call\n");
     return -1;
-}
-
-/* ========== Debug: print tasks list ========== */
-
-void debug_print_tasks_list(int max_count)
-{
-    struct task_struct *p;
-    int count = 0;
-
-    pr_info("wxshadow: === DEBUG: tasks list (first %d processes) ===\n", max_count);
-    pr_info("wxshadow: task_struct_offset addr: %px\n", &task_struct_offset);
-    pr_info("wxshadow: task_struct_offset: tasks=0x%x (%d), comm=0x%x (%d), mm=0x%x (%d)\n",
-            (unsigned short)task_struct_offset.tasks_offset, task_struct_offset.tasks_offset,
-            (unsigned short)task_struct_offset.comm_offset, task_struct_offset.comm_offset,
-            (unsigned short)task_struct_offset.mm_offset, task_struct_offset.mm_offset);
-    pr_info("wxshadow: pid/tgid: using wxfunc(__task_pid_nr_ns)\n");
-
-    pr_info("wxshadow: wx_init_task = %px\n", wx_init_task);
-
-    if (task_struct_offset.tasks_offset < 0 ||
-        task_struct_offset.comm_offset < 0) {
-        pr_err("wxshadow: tasks_offset (%d) or comm_offset (%d) not initialized!\n",
-               task_struct_offset.tasks_offset, task_struct_offset.comm_offset);
-        return;
-    }
-
-    if (!wx_init_task) {
-        pr_err("wxshadow: wx_init_task is NULL!\n");
-        return;
-    }
-
-    pr_info("wxshadow: wx_init_task (swapper) at %px\n", wx_init_task);
-
-    /* Iterate using wx_next_task() - fixed implementation in wxshadow_internal.h */
-    for (p = wx_init_task; (p = wx_next_task(p)) != wx_init_task && count < max_count; ) {
-        pid_t pid = 0;
-        pid_t tgid = 0;
-        const char *comm;
-        void *mm = NULL;
-
-        /* Use wxfunc(__task_pid_nr_ns) */
-        pid = wxfunc(__task_pid_nr_ns)(p, PIDTYPE_PID, NULL);
-        tgid = wxfunc(__task_pid_nr_ns)(p, PIDTYPE_TGID, NULL);
-
-        /* Use get_task_comm helper from linux/sched.h */
-        comm = get_task_comm(p);
-
-        if (task_struct_offset.mm_offset >= 0) {
-            safe_read_ptr((unsigned long)p + task_struct_offset.mm_offset, &mm);
-        }
-
-        pr_info("wxshadow: [%d] task=%px pid=%d tgid=%d mm=%px comm=\"%.16s\"\n",
-                count, p, pid, tgid, mm, comm ? comm : "(null)");
-
-        count++;
-    }
-
-    pr_info("wxshadow: === END tasks list (%d processes printed) ===\n", count);
 }

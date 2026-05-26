@@ -66,9 +66,22 @@ function(add_kpm_module MODULE_NAME)
         -fno-unwind-tables
     )
 
+    set(KPM_RELOCATE_FLAGS "")
+    if(CMAKE_C_COMPILER_TARGET)
+        list(APPEND KPM_RELOCATE_FLAGS "--target=${CMAKE_C_COMPILER_TARGET}")
+    endif()
+    if(CMAKE_C_FLAGS)
+        separate_arguments(KPM_GLOBAL_C_FLAGS UNIX_COMMAND "${CMAKE_C_FLAGS}")
+        list(APPEND KPM_RELOCATE_FLAGS ${KPM_GLOBAL_C_FLAGS})
+    endif()
+    if(CMAKE_EXE_LINKER_FLAGS)
+        separate_arguments(KPM_GLOBAL_LINKER_FLAGS UNIX_COMMAND "${CMAKE_EXE_LINKER_FLAGS}")
+        list(APPEND KPM_RELOCATE_FLAGS ${KPM_GLOBAL_LINKER_FLAGS})
+    endif()
 
     add_custom_target(${MODULE_NAME}.kpm ALL
-            COMMAND ${CMAKE_C_COMPILER} -r -o ${MODULE_NAME}.kpm "$<TARGET_OBJECTS:${MODULE_NAME}_obj>"
+            COMMAND ${CMAKE_C_COMPILER} ${KPM_RELOCATE_FLAGS}
+                    -r -o ${MODULE_NAME}.kpm "$<TARGET_OBJECTS:${MODULE_NAME}_obj>"
             DEPENDS ${MODULE_NAME}_obj
             COMMENT "Generating ${MODULE_NAME}.kpm"
             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
@@ -100,5 +113,4 @@ foreach(child ${CHILD_MODULES})
         add_subdirectory(kpms/${child})
     endif()
 endforeach()
-
 

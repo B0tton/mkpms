@@ -57,7 +57,12 @@ static int prepare_shadow_target(void *mm, unsigned long addr,
     void *vma;
     int ret;
 
-    vma = kfunc_find_vma(mm, addr);
+    if (!(kfunc_find_vma || kfunc_find_vma_prev)) {
+        pr_err("wxshadow: [%s] find_vma unavailable\n", op);
+        return -38;  /* ENOSYS */
+    }
+
+    vma = wxshadow_find_vma(mm, addr);
     if (!vma || vma_start(vma) > addr) {
         pr_err("wxshadow: [%s] no vma for %lx\n", op, addr);
         return -1;
@@ -104,6 +109,11 @@ static int create_shadow_page_common(void *mm, unsigned long page_addr,
     u64 *pte;
     unsigned long orig_pfn;
     unsigned long shadow_vaddr;
+
+    if (!kfunc___get_free_pages) {
+        pr_err("wxshadow: [%s] __get_free_pages unavailable\n", op);
+        return -38;  /* ENOSYS */
+    }
 
     page_info = wxshadow_create_page(mm, page_addr);
     if (!page_info) {
@@ -607,7 +617,8 @@ static int wxshadow_rebuild_shadow_range(struct wxshadow_page *page_info,
     spin_lock(&global_lock);
     if (!page_info->shadow_page || !page_info->pfn_original) {
         spin_unlock(&global_lock);
-        kfunc_kfree(ops);
+        if (kfunc_kfree)
+            kfunc_kfree(ops);
         return -14;
     }
 
@@ -659,7 +670,8 @@ static int wxshadow_rebuild_shadow_range(struct wxshadow_page *page_info,
 
     original_kaddr = (const char *)pfn_to_kaddr(original_pfn);
     if (!is_kva((unsigned long)original_kaddr)) {
-        kfunc_kfree(ops);
+        if (kfunc_kfree)
+            kfunc_kfree(ops);
         return -14;
     }
 
@@ -700,7 +712,8 @@ static int wxshadow_rebuild_shadow_range(struct wxshadow_page *page_info,
 
     wxshadow_flush_kern_dcache_area(shadow_vaddr + offset, len);
     wxshadow_flush_icache_page(page_addr);
-    kfunc_kfree(ops);
+    if (kfunc_kfree)
+        kfunc_kfree(ops);
     return 0;
 }
 
@@ -881,7 +894,8 @@ retry:
     wxshadow_page_pte_unlock(page_info);
 
     for (i = 0; i < nr_free; i++)
-        kfunc_kfree(free_patch_data[i]);
+        if (kfunc_kfree)
+            kfunc_kfree(free_patch_data[i]);
 
     if (ret < 0) {
         /* Rebuild failed after metadata changed; retire the page instead of
@@ -909,6 +923,10 @@ int wxshadow_do_set_bp(void *mm, unsigned long addr)
     int bp_idx;
 
     pr_info("wxshadow: [set_bp] addr=%lx\n", addr);
+
+    ret = require_tlb_flush_capability("set_bp");
+    if (ret < 0)
+        return ret;
 
     ret = wxshadow_acquire_write_ctx(mm, addr, "set_bp", &ctx);
     if (ret < 0)
@@ -1039,39 +1057,51 @@ static void *copy_from_user_via_pte(void __user *ubuf, unsigned long len)
         return NULL;
     }
 
+    if (!kfunc_get_task_mm) {
+        pr_err("wxshadow: get_task_mm unavailable for user buffer copy\n");
+        return NULL;
+    }
+
+    if (!kfunc_kzalloc) {
+        pr_err("wxshadow: kzalloc unavailable for user buffer copy\n");
+        return NULL;
+    }
+
     caller_mm = kfunc_get_task_mm(current);
     if (!caller_mm)
         return NULL;
 
     /* Split PMD block if user buffer is in THP */
-    {
-        void *buf_vma = kfunc_find_vma(caller_mm, uaddr);
+    if (kfunc_find_vma || kfunc_find_vma_prev) {
+        void *buf_vma = wxshadow_find_vma(caller_mm, uaddr);
         if (buf_vma && vma_start(buf_vma) <= uaddr)
             wxshadow_try_split_pmd(caller_mm, buf_vma, buf_page);
+    } else {
+        pr_warn("wxshadow: find_vma unavailable, skipping user buffer PMD split\n");
     }
 
     buf_pte = get_user_pte(caller_mm, buf_page, NULL);
     if (!buf_pte || !(*buf_pte & PTE_VALID)) {
         pr_err("wxshadow: no PTE for user buffer %lx\n", uaddr);
-        kfunc_mmput(caller_mm);
+        wxshadow_mmput_safe(caller_mm);
         return NULL;
     }
 
     buf_pfn = (*buf_pte >> PAGE_SHIFT) & 0xFFFFFFFFFUL;
     buf_kaddr = pfn_to_kaddr(buf_pfn);
     if (!is_kva((unsigned long)buf_kaddr)) {
-        kfunc_mmput(caller_mm);
+        wxshadow_mmput_safe(caller_mm);
         return NULL;
     }
 
     kbuf = kfunc_kzalloc(len, 0xcc0);
     if (!kbuf) {
-        kfunc_mmput(caller_mm);
+        wxshadow_mmput_safe(caller_mm);
         return NULL;
     }
 
     memcpy(kbuf, (char *)buf_kaddr + buf_off, len);
-    kfunc_mmput(caller_mm);
+    wxshadow_mmput_safe(caller_mm);
     return kbuf;
 }
 
@@ -1124,7 +1154,8 @@ int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned l
         }
 
         if (old_patch_data) {
-            kfunc_kfree(old_patch_data);
+            if (kfunc_kfree)
+                kfunc_kfree(old_patch_data);
             old_patch_data = NULL;
         }
         pr_info("wxshadow: [patch] existing shadow %lx+%lx (%lu bytes)\n",
@@ -1158,15 +1189,19 @@ int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned l
     }
 
     wxshadow_put_write_ctx(&ctx);
-    kfunc_kfree(patch_data);
+    if (patch_data && kfunc_kfree)
+        kfunc_kfree(patch_data);
     return 0;
 
 out_free_page:
     wxshadow_abort_write_ctx(&ctx);
 out_free:
-    if (old_patch_data)
-        kfunc_kfree(old_patch_data);
-    kfunc_kfree(patch_data);
+    if (old_patch_data) {
+        if (kfunc_kfree)
+            kfunc_kfree(old_patch_data);
+    }
+    if (patch_data && kfunc_kfree)
+        kfunc_kfree(patch_data);
     return ret;
 }
 
@@ -1222,8 +1257,19 @@ static void *resolve_pid_to_mm(pid_t pid)
 {
     void *mm;
 
+    if (!kfunc_get_task_mm) {
+        pr_err("wxshadow: get_task_mm unavailable\n");
+        return NULL;
+    }
+
     if (pid == 0)
         return kfunc_get_task_mm(current);
+
+    if (!kfunc_rcu_read_lock || !kfunc_rcu_read_unlock ||
+        !wxfunc(find_task_by_vpid)) {
+        pr_err("wxshadow: task lookup unavailable for pid=%d\n", pid);
+        return NULL;
+    }
 
     kfunc_rcu_read_lock();
     {
@@ -1265,7 +1311,7 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         mm = resolve_pid_to_mm(pid);
         if (!mm) { args->ret = -3; args->skip_origin = 1; break; }
         ret = wxshadow_do_set_bp(mm, arg3);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         args->ret = ret;
         args->skip_origin = 1;
         break;
@@ -1275,7 +1321,7 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         mm = resolve_pid_to_mm(pid);
         if (!mm) { args->ret = -3; args->skip_origin = 1; break; }
         ret = wxshadow_do_set_reg(mm, arg3, (unsigned int)arg4, arg5);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         args->ret = ret;
         args->skip_origin = 1;
         break;
@@ -1289,7 +1335,7 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         } else {
             ret = wxshadow_do_del_bp(mm, arg3);
         }
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         args->ret = ret;
         args->skip_origin = 1;
         break;
@@ -1318,7 +1364,7 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         mm = resolve_pid_to_mm(pid);
         if (!mm) { args->ret = -3; args->skip_origin = 1; break; }
         ret = wxshadow_do_patch(mm, arg3, (void __user *)arg4, arg5);
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         args->ret = ret;
         args->skip_origin = 1;
         break;
@@ -1332,7 +1378,7 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         } else {
             ret = wxshadow_do_release(mm, arg3);
         }
-        kfunc_mmput(mm);
+        wxshadow_mmput_safe(mm);
         args->ret = ret;
         args->skip_origin = 1;
         break;
